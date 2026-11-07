@@ -1,14 +1,12 @@
 import os
+import sys
 import time
 import shutil
-import tempfile
 import threading
 import traceback
 import subprocess
 import warnings
 from collections import deque
-import tkinter as tk
-from tkinter import filedialog
 
 if not hasattr(time, "perf_counter_ns"):
     time.perf_counter_ns = lambda: int(time.perf_counter() * 1e9)
@@ -19,25 +17,18 @@ import mss
 import soundcard as sc
 from scipy.io import wavfile
 from pynput import keyboard, mouse
-from PIL import Image, ImageDraw
-import pystray
-
-try:
-    from winotify import Notification, audio
-    HAVE_WINOTIFY = True
-except Exception:
-    HAVE_WINOTIFY = False
+from PySide6.QtCore import Qt, QPoint, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QIcon, QPainter, QPalette, QPen, QPixmap, QPolygon
+)
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QListWidget, QMenu, QPushButton, QSpinBox,
+    QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget
+)
 
 warnings.simplefilter("ignore")
 
-try:
-    import ctypes
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        ctypes.windll.user32.SetProcessDPIAware()
-except Exception:
-    pass
 
 def get_ffmpeg():
     exe = shutil.which("ffmpeg")
@@ -49,8 +40,10 @@ def get_ffmpeg():
     except Exception:
         return None
 
+
 def unique_timestamp():
-    return time.strftime("%Y%bound%d_%H%M%S") + "_{:03d}".format(int(time.time() * 1000) % 1000)
+    return time.strftime("%Y%m%d_%H%M%S") + "_{:03d}".format(int(time.time() * 1000) % 1000)
+
 
 def safe_replace(src, dst, retries=10, delay=0.2):
     if not os.path.exists(src):
@@ -67,6 +60,7 @@ def safe_replace(src, dst, retries=10, delay=0.2):
             return False
     return False
 
+
 def safe_remove(path, retries=10, delay=0.2):
     if not os.path.exists(path):
         return False
@@ -80,6 +74,7 @@ def safe_remove(path, retries=10, delay=0.2):
             return False
     return False
 
+
 def merge_video_audio(temp_video, temp_audio, final_output):
     ffmpeg_exe = get_ffmpeg()
     if not ffmpeg_exe:
@@ -88,9 +83,9 @@ def merge_video_audio(temp_video, temp_audio, final_output):
         return False
 
     cmd = [
-        ffmpeg_exe, "-temp",
-        "-idx", temp_video,
-        "-idx", temp_audio,
+        ffmpeg_exe, "-y",
+        "-i", temp_video,
+        "-i", temp_audio,
         "-c:v", "copy",
         "-c:a", "aac",
         "-shortest",
@@ -105,15 +100,6 @@ def merge_video_audio(temp_video, temp_audio, final_output):
         print("FFmpeg merge failed:", e)
         return False
 
-def make_tray_image(recording=False):
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle((2, 2, size - 2, size - 2), radius=14, fill=(30, 30, 46, 255))
-    d.polygon([(24, 18), (24, 46), (48, 32)], fill=(255, 255, 255, 255))
-    if recording:
-        d.ellipse((38, 4, 60, 26), fill=(239, 83, 80, 255), outline=(30, 30, 46, 255), width=3)
-    return img
 
 class AudioRecorder:
     CHUNK = 4096
@@ -148,7 +134,7 @@ class AudioRecorder:
     def _record_loop(self):
         try:
             speaker = sc.default_speaker()
-            loopback = sc.get_microphone(id=text(speaker.name), include_loopback=True)
+            loopback = sc.get_microphone(id=str(speaker.name), include_loopback=True)
             with loopback.recorder(samplerate=self.sample_rate, channels=2) as mic:
                 while self.is_recording:
                     self.buffer.append(mic.record(numframes=self.CHUNK))
@@ -176,12 +162,91 @@ class AudioRecorder:
             print("Audio save error:", e)
             return False
 
-class GameplayClipperApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Clippy")
-        self.root.geometry("480x360")
-        self.root.resizable(False, False)
+
+BUTTON_KINDS = {
+    "green": ("#2e7d32", "#388e3c"),
+    "red": ("#c62828", "#d32f2f"),
+    "blue": ("#1565c0", "#1976d2"),
+    "orange": ("#ef6c00", "#fb8c00"),
+    "amber": ("#ffb300", "#ffc107"),
+    "slate": ("#37474f", "#455a64"),
+}
+
+
+def build_stylesheet():
+    rules = [
+        "QFrame#sidebar { background-color: #11111b; }",
+        "QLabel { background: transparent; }",
+        "QLabel#title { font-size: 24px; font-weight: bold; }",
+        'QLabel[muted="true"] { color: #8b8fa8; }',
+        "QPushButton { background-color: #313244; border: none; border-radius: 6px; padding: 7px 12px; }",
+        "QPushButton:hover { background-color: #3d3f57; }",
+        "QPushButton:disabled { background-color: #232436; color: #6c7086; }",
+        "QPushButton#nav { background: transparent; font-size: 20px; padding: 10px 0px; border-radius: 10px; }",
+        "QPushButton#nav:hover { background-color: #2a2a3d; }",
+    ]
+    for name, (normal, hover) in BUTTON_KINDS.items():
+        text = "#1e1e2e" if name == "amber" else "white"
+        rules.append('QPushButton[kind="%s"] { background-color: %s; color: %s; font-weight: bold; }'
+                     % (name, normal, text))
+        rules.append('QPushButton[kind="%s"]:hover { background-color: %s; }' % (name, hover))
+        rules.append('QPushButton[kind="%s"]:disabled { background-color: #232436; color: #6c7086; }' % name)
+    return "\n".join(rules)
+
+
+def apply_dark_palette(app):
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor("#181825"))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor("#cdd6f4"))
+    pal.setColor(QPalette.ColorRole.Base, QColor("#1e1e2e"))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#181825"))
+    pal.setColor(QPalette.ColorRole.Text, QColor("#cdd6f4"))
+    pal.setColor(QPalette.ColorRole.Button, QColor("#313244"))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor("#cdd6f4"))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor("#1565c0"))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor("white"))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#313244"))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#cdd6f4"))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#6c7086"))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#6c7086"))
+    app.setPalette(pal)
+
+
+def set_kind(widget, kind):
+    widget.setProperty("kind", kind)
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
+def make_icon(recording=False):
+    pix = QPixmap(64, 64)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor("#1e1e2e"))
+    p.drawRoundedRect(2, 2, 60, 60, 14, 14)
+    p.setBrush(QColor("white"))
+    p.drawPolygon(QPolygon([QPoint(24, 18), QPoint(24, 46), QPoint(48, 32)]))
+    if recording:
+        p.setPen(QPen(QColor("#1e1e2e"), 3))
+        p.setBrush(QColor("#ef5350"))
+        p.drawEllipse(38, 4, 22, 22)
+    p.end()
+    return QIcon(pix)
+
+
+class ClippyWindow(QWidget):
+    invoke = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.invoke.connect(self._run_call)
+
+        self.setWindowTitle("Clippy")
+        self.setWindowIcon(make_icon())
+        self.setMinimumSize(520, 680)
+        self.resize(540, 720)
 
         self.fps = 30
         self.clip_duration = 15
@@ -190,52 +255,54 @@ class GameplayClipperApp:
         self.capture_thread = None
 
         self.is_screen_recording = False
-        self.screen_rec_thread = None
         self.screen_rec_start_time = 0
 
-        self.rec_key = "F1"
-        self.clip_key = "F2"
+        self.keys = {"record": "F1", "clip": "F2", "macro_play": "F3", "macro_rec": "F4"}
         self.rebinding_target = None
         self._held = {}
+
+        self.save_directory = os.path.join(os.path.expanduser("~"), "Videos")
+        if not os.path.exists(self.save_directory):
+            self.save_directory = os.getcwd()
 
         self.audio_recorder = AudioRecorder(duration_sec=self.clip_duration)
         self.screen_audio = AudioRecorder(duration_sec=None)
 
-        self.sidebar = tk.Frame(root, bg="
-        self.sidebar.pack(side="left", fill="temp")
-        self.sidebar.pack_propagate(False)
+        self.macro_steps = []
+        self._macro_stop = threading.Event()
+        self._macro_running = False
+        self._macro_countdown = False
+        self._countdown_left = 0
+        self._mouse = mouse.Controller()
 
-        self.content_area = tk.Frame(root)
-        self.content_area.pack(side="right", fill="both", expand=True)
+        self._macro_recording = False
+        self._rec_listener = None
+        self._rec_events = []
+        self._rec_latest = None
+        self._rec_t0 = 0.0
+        self._rec_secs = 5.0
+        self._rec_rect = None
+        self._rec_last_sample = 0.0
 
-        self.nav_controller_btn = tk.Button(
-            self.sidebar, text="▶", font=("Segoe UI Symbol", 14),
-            bg="
-            activeforeground="white", bd=0, cursor="hand2",
-            command=self.show_main_page
-        )
-        self.nav_controller_btn.pack(side="top", pady=(12, 6), anchor="center")
+        self._quitting = False
+        self._tray_hint_shown = False
+        self._toast_folder = None
 
-        self.nav_screen_rec_btn = tk.Button(
-            self.sidebar, text="●", font=("Segoe UI Symbol", 14),
-            bg="
-            activeforeground="
-            command=self.show_screen_rec_page
-        )
-        self.nav_screen_rec_btn.pack(side="top", pady=6, anchor="center")
+        self.screen_timer = QTimer(self)
+        self.screen_timer.setInterval(1000)
+        self.screen_timer.timeout.connect(self._update_screen_rec_timer)
 
-        self.nav_settings_btn = tk.Button(
-            self.sidebar, text="⚙", font=("Helvetica", 14, "bold"),
-            bg="
-            activeforeground="white", bd=0, cursor="hand2",
-            command=self.show_settings_page
-        )
-        self.nav_settings_btn.pack(side="bottom", pady=12, anchor="center")
+        self.countdown_timer = QTimer(self)
+        self.countdown_timer.setInterval(1000)
+        self.countdown_timer.timeout.connect(self._countdown_step)
 
-        self._build_main_view()
-        self._build_screen_rec_view()
-        self._build_settings_view()
-        self.show_main_page()
+        self.rec_timer = QTimer(self)
+        self.rec_timer.setInterval(100)
+        self.rec_timer.timeout.connect(self._rec_tick)
+
+        self._build_ui()
+        self._build_tray()
+        self.refresh_labels()
 
         self.hotkey_listener = keyboard.Listener(
             on_press=self._on_key_press,
@@ -244,200 +311,426 @@ class GameplayClipperApp:
         self.hotkey_listener.daemon = True
         self.hotkey_listener.start()
 
-    def show_main_page(self):
-        self.settings_frame.pack_forget()
-        self.screen_rec_frame.pack_forget()
-        self.main_frame.pack(fill="both", expand=True)
+    def _run_call(self, fn):
+        try:
+            fn()
+        except Exception:
+            traceback.print_exc()
 
-    def show_screen_rec_page(self):
-        self.main_frame.pack_forget()
-        self.settings_frame.pack_forget()
-        self.screen_rec_frame.pack(fill="both", expand=True)
+    def ui(self, fn):
+        self.invoke.emit(fn)
 
-    def show_settings_page(self):
-        self.main_frame.pack_forget()
-        self.screen_rec_frame.pack_forget()
-        self.settings_frame.pack(fill="both", expand=True)
+    def _build_ui(self):
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-    def _build_main_view(self):
-        self.main_frame = tk.Frame(self.content_area)
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(64)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(6, 12, 6, 12)
+        side.setSpacing(6)
 
-        self.title_label = tk.Label(self.main_frame, text="CLIPPY", font=("Helvetica", 18, "bold"))
-        self.title_label.pack(pady=(20, 10))
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_main_page())
+        self.stack.addWidget(self._build_screen_page())
+        self.stack.addWidget(self._build_macro_page())
+        self.stack.addWidget(self._build_settings_page())
 
-        self.toggle_btn = tk.Button(
-            self.main_frame, text="Record Buffer ({})".format(self.rec_key),
-            command=self.toggle_buffer, bg="
-            font=("Helvetica", 11, "bold"), width=22, pady=5, relief="flat"
-        )
-        self.toggle_btn.pack(pady=8)
+        def nav(text, index, color=None):
+            btn = QPushButton(text)
+            btn.setObjectName("nav")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            if color:
+                btn.setStyleSheet("color: %s;" % color)
+            btn.clicked.connect(lambda _=False, i=index: self.stack.setCurrentIndex(i))
+            return btn
 
-        self.clip_btn = tk.Button(
-            self.main_frame, text="SAVE CLIP ({})".format(self.clip_key),
-            command=self.save_clip, bg="
-            font=("Helvetica", 11, "bold"), width=22, pady=8,
-            relief="flat", state="disabled"
-        )
-        self.clip_btn.pack(pady=8)
+        side.addWidget(nav("▶", 0))
+        side.addWidget(nav("●", 1, "#ef5350"))
+        side.addWidget(nav("⌖", 2, "#89b4fa"))
+        side.addStretch()
+        side.addWidget(nav("⚙", 3))
 
-        self.status_label = tk.Label(
-            self.main_frame, text="Status: Idle",
-            font=("Helvetica", 10, "bold"), fg="
-        )
-        self.status_label.pack(pady=4)
+        outer.addWidget(sidebar)
+        outer.addWidget(self.stack, 1)
 
-        self.info_label = tk.Label(
-            self.main_frame,
-            text="Keep this running in the background while playing.",
-            font=("Helvetica", 9, "italic"), fg="
-        )
-        self.info_label.pack(side="bottom", pady=12)
+    def _page(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(26, 22, 26, 18)
+        lay.setSpacing(10)
+        return page, lay
 
-    def _build_screen_rec_view(self):
-        self.screen_rec_frame = tk.Frame(self.content_area)
+    def _title(self, text):
+        label = QLabel(text)
+        label.setObjectName("title")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        return label
 
-        tk.Label(self.screen_rec_frame, text="SCREEN RECORDER",
-                 font=("Helvetica", 18, "bold")).pack(pady=(20, 10))
+    def _muted(self, text, italic=False, small=False):
+        label = QLabel(text)
+        label.setProperty("muted", True)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        font = label.font()
+        font.setItalic(italic)
+        if small:
+            font.setPointSize(8)
+        label.setFont(font)
+        return label
 
-        self.screen_rec_btn = tk.Button(
-            self.screen_rec_frame, text="Start Screen Recording",
-            command=self.toggle_screen_recording, bg="
-            font=("Helvetica", 11, "bold"), width=24, pady=8, relief="flat"
-        )
-        self.screen_rec_btn.pack(pady=15)
+    def _big_button(self, kind, slot, width=280, height=42):
+        btn = QPushButton()
+        btn.setFixedSize(width, height)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setProperty("kind", kind)
+        btn.clicked.connect(slot)
+        return btn
 
-        self.screen_rec_status = tk.Label(
-            self.screen_rec_frame, text="Status: Idle",
-            font=("Helvetica", 10, "bold"), fg="
-        )
-        self.screen_rec_status.pack(pady=5)
+    def _status_label(self, text):
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setStyleSheet("font-weight: bold; color: #8b8fa8;")
+        return label
 
-        self.screen_rec_timer = tk.Label(
-            self.screen_rec_frame, text="00:00:00",
-            font=("Helvetica", 14, "bold"), fg="
-        )
-        self.screen_rec_timer.pack(pady=5)
+    def _color_label(self, label, color):
+        label.setStyleSheet("font-weight: bold; color: %s;" % color)
 
-    def toggle_screen_recording(self):
-        if not self.is_screen_recording:
-            self.is_screen_recording = True
-            self.screen_rec_btn.config(text="Stop Screen Recording", bg="
-            self.screen_rec_status.config(text="Status: Recording...", fg="
-            self.screen_rec_start_time = time.time()
+    def _build_main_page(self):
+        page, lay = self._page()
+        lay.addWidget(self._title("CLIPPY"))
+        lay.addSpacing(16)
 
-            if self._audio_enabled():
-                self.screen_audio.start()
+        self.toggle_btn = self._big_button("green", self.toggle_buffer)
+        self.clip_btn = self._big_button("blue", self.save_clip, height=50)
+        self.clip_btn.setEnabled(False)
+        self.status_label = self._status_label("Status: Idle")
 
-            self.screen_rec_thread = threading.Thread(target=self._run_screen_recording, daemon=True)
-            self.screen_rec_thread.start()
-            self._update_screen_rec_timer()
-            self._notify("Screen recording started", "Clippy is recording your screen.")
-        else:
-            self.is_screen_recording = False
-            self.screen_rec_btn.config(text="Start Screen Recording", bg="
-            self.screen_rec_status.config(text="Status: Processing...", fg="
+        lay.addWidget(self.toggle_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(self.clip_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(self.status_label)
+        lay.addStretch()
+        lay.addWidget(self._muted("Keep this running in the background while playing.", italic=True))
+        return page
 
-    def _update_screen_rec_timer(self):
-        if self.is_screen_recording:
-            elapsed = int(time.time() - self.screen_rec_start_time)
-            hrs = elapsed // 3600
-            mins = (elapsed % 3600) // 60
-            secs = elapsed % 60
-            self.screen_rec_timer.config(text="{:02d}:{:02d}:{:02d}".format(hrs, mins, secs))
-            self.root.after(1000, self._update_screen_rec_timer)
+    def _build_screen_page(self):
+        page, lay = self._page()
+        lay.addWidget(self._title("SCREEN RECORDER"))
+        lay.addSpacing(16)
 
-    def _run_screen_recording(self):
-        timestamp = unique_timestamp()
-        target_dir = self._get_save_dir()
-        temp_video = os.path.join(target_dir, "temp_rec_video_{}.mp4".format(timestamp))
-        temp_audio = os.path.join(target_dir, "temp_rec_audio_{}.wav".format(timestamp))
-        final_output = os.path.join(target_dir, "recording_{}.mp4".format(timestamp))
+        self.screen_rec_btn = self._big_button("red", self.toggle_screen_recording)
+        self.screen_rec_btn.setText("Start Screen Recording")
+        self.screen_rec_status = self._status_label("Status: Idle")
+        self.screen_rec_timer_label = QLabel("00:00:00")
+        self.screen_rec_timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.screen_rec_timer_label.setStyleSheet("font-size: 22px; font-weight: bold;")
 
-        record_audio = self._audio_enabled()
+        lay.addWidget(self.screen_rec_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(self.screen_rec_status)
+        lay.addWidget(self.screen_rec_timer_label)
+        lay.addStretch()
+        return page
 
-        with mss.mss() as sct:
-            monitor = sct.monitors[1] if length(sct.monitors) > 1 else sct.monitors[0]
-            width = monitor["width"]
-            height = monitor["height"]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out = cv2.VideoWriter(temp_video, fourcc, float(self.fps), (width, height))
+    def _build_macro_page(self):
+        page, lay = self._page()
+        lay.setSpacing(8)
+        lay.addWidget(self._title("MACRO"))
+        lay.addWidget(self._muted("Click controls to add steps, then press play.", italic=True))
 
-            frame_delay = 1.0 / self.fps
-            while self.is_screen_recording:
-                start_time = time.time()
-                try:
-                    sct_img = sct.grab(monitor)
-                    frame_np = np.array(sct_img)
-                    frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_BGRA2BGR)
-                    out.write(frame_bgr)
-                except Exception:
-                    pass
+        grid = QGridLayout()
+        grid.setSpacing(6)
 
-                sleep_time = frame_delay - (time.time() - start_time)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+        def move_button(text, row, col, ux, uy):
+            btn = QPushButton(text)
+            btn.setProperty("kind", "slate")
+            btn.setFixedWidth(136)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, a=ux, b=uy: self._add_move(a, b))
+            grid.addWidget(btn, row, col)
 
-            out.release()
-            del out
+        move_button("▲  Mouse Up", 0, 1, 0, -1)
+        move_button("◀  Mouse Left", 1, 0, -1, 0)
+        move_button("Mouse Right  ▶", 1, 2, 1, 0)
+        move_button("▼  Mouse Down", 2, 1, 0, 1)
+        center = QLabel("✥")
+        center.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        center.setStyleSheet("font-size: 18px; color: #8b8fa8;")
+        grid.addWidget(center, 1, 1)
 
-        time.sleep(0.2)
+        pad_row = QHBoxLayout()
+        pad_row.addStretch()
+        pad_row.addLayout(grid)
+        pad_row.addStretch()
+        lay.addLayout(pad_row)
 
-        has_audio = False
-        if record_audio:
-            self.screen_audio.stop()
-            has_audio = self.screen_audio.save_wav(temp_audio)
+        click_row = QHBoxLayout()
+        click_row.addStretch()
+        for text, step in (
+            ("Left Click", {"type": "click", "button": "left"}),
+            ("Right Click", {"type": "click", "button": "right"}),
+            ("Hold Left", {"type": "down", "button": "left"}),
+            ("Release Left", {"type": "up", "button": "left"}),
+        ):
+            btn = QPushButton(text)
+            btn.setProperty("kind", "slate")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, s=step: self._add_step(dict(s)))
+            click_row.addWidget(btn)
+        click_row.addStretch()
+        lay.addLayout(click_row)
 
-        merged = False
-        if has_audio and os.path.exists(temp_video):
-            merged = merge_video_audio(temp_video, temp_audio, final_output)
-            if merged:
-                safe_remove(temp_video)
-            safe_remove(temp_audio)
+        rec_row = QHBoxLayout()
+        rec_row.addStretch()
+        self.macro_rec_btn = QPushButton()
+        self.macro_rec_btn.setFixedWidth(230)
+        self.macro_rec_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.macro_rec_btn.setProperty("kind", "red")
+        self.macro_rec_btn.clicked.connect(lambda: self.toggle_macro_recording())
+        rec_row.addWidget(self.macro_rec_btn)
+        rec_row.addSpacing(8)
+        rec_row.addWidget(QLabel("Length (s)"))
+        self.rec_secs_spin = QSpinBox()
+        self.rec_secs_spin.setRange(1, 60)
+        self.rec_secs_spin.setValue(5)
+        rec_row.addWidget(self.rec_secs_spin)
+        rec_row.addStretch()
+        lay.addLayout(rec_row)
 
-        if not merged and os.path.exists(temp_video):
-            safe_replace(temp_video, final_output)
+        opt_row = QHBoxLayout()
+        opt_row.addStretch()
+        opt_row.addWidget(QLabel("Distance (px)"))
+        self.dist_spin = QSpinBox()
+        self.dist_spin.setRange(1, 2000)
+        self.dist_spin.setSingleStep(10)
+        self.dist_spin.setValue(50)
+        opt_row.addWidget(self.dist_spin)
+        opt_row.addSpacing(10)
+        opt_row.addWidget(QLabel("Wait (s)"))
+        self.wait_spin = QDoubleSpinBox()
+        self.wait_spin.setRange(0.05, 60.0)
+        self.wait_spin.setSingleStep(0.25)
+        self.wait_spin.setDecimals(2)
+        self.wait_spin.setValue(0.5)
+        opt_row.addWidget(self.wait_spin)
+        add_wait = QPushButton("Add Wait")
+        add_wait.setProperty("kind", "slate")
+        add_wait.clicked.connect(lambda: self._add_wait())
+        opt_row.addWidget(add_wait)
+        opt_row.addStretch()
+        lay.addLayout(opt_row)
 
-        if os.path.exists(final_output):
-            self._notify("Recording saved", os.path.basename(final_output), folder=target_dir)
-        else:
-            self._notify("Recording failed", "No file was created.")
+        self.macro_list = QListWidget()
+        self.macro_list.setFont(QFont("Consolas", 10))
+        self.macro_list.setMinimumHeight(140)
+        lay.addWidget(self.macro_list, 1)
 
-        self.root.after(0, lambda: self.screen_rec_status.config(text="Status: Idle", fg="
-        self.root.after(0, lambda: self.screen_rec_timer.config(text="00:00:00"))
+        edit_row = QHBoxLayout()
+        edit_row.addStretch()
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(lambda: self._remove_step())
+        clear_btn = QPushButton("Clear All")
+        clear_btn.clicked.connect(lambda: self._clear_steps())
+        edit_row.addWidget(remove_btn)
+        edit_row.addWidget(clear_btn)
+        edit_row.addSpacing(10)
+        edit_row.addWidget(QLabel("Repeat (0 = loop)"))
+        self.repeat_spin = QSpinBox()
+        self.repeat_spin.setRange(0, 9999)
+        self.repeat_spin.setValue(1)
+        edit_row.addWidget(self.repeat_spin)
+        edit_row.addStretch()
+        lay.addLayout(edit_row)
 
-    def _build_settings_view(self):
-        self.settings_frame = tk.Frame(self.content_area)
+        self.macro_play_btn = self._big_button("green", lambda: self.toggle_macro(3))
+        lay.addWidget(self.macro_play_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        tk.Label(self.settings_frame, text="Settings", font=("Helvetica", 16, "bold")).pack(pady=(15, 5))
-        tk.Label(self.settings_frame, text="Keybinds",
-                 font=("Helvetica", 12, "bold", "underline")).pack(pady=(5, 15))
+        self.macro_status = self._status_label("Ready")
+        lay.addWidget(self.macro_status)
+        return page
 
-        rec_row = tk.Frame(self.settings_frame)
-        rec_row.pack(fill="data", padx=40, pady=5)
-        tk.Label(rec_row, text="Start Recording:", font=("Helvetica", 10),
-                 width=16, anchor="w").pack(side="left")
-        self.rec_key_btn = tk.Button(
-            rec_row, text=self.rec_key, font=("Helvetica", 10, "bold"), width=12,
-            command=lambda: self._start_rebind("record")
-        )
-        self.rec_key_btn.pack(side="right")
+    def _build_settings_page(self):
+        page, lay = self._page()
+        lay.addWidget(self._title("Settings"))
 
-        clip_row = tk.Frame(self.settings_frame)
-        clip_row.pack(fill="data", padx=40, pady=5)
-        tk.Label(clip_row, text="Clip:", font=("Helvetica", 10),
-                 width=16, anchor="w").pack(side="left")
-        self.clip_key_btn = tk.Button(
-            clip_row, text=self.clip_key, font=("Helvetica", 10, "bold"), width=12,
-            command=lambda: self._start_rebind("clip")
-        )
-        self.clip_key_btn.pack(side="right")
+        heading = QLabel("Keybinds")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        heading.setStyleSheet("font-size: 15px; font-weight: bold; text-decoration: underline;")
+        lay.addWidget(heading)
+        lay.addSpacing(6)
+
+        self.key_buttons = {}
+        for target, label in (
+            ("record", "Start Recording"),
+            ("clip", "Clip"),
+            ("macro_play", "Play Macro"),
+            ("macro_rec", "Record Macro"),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label + ":"))
+            row.addStretch()
+            btn = QPushButton()
+            btn.setFixedWidth(140)
+            btn.clicked.connect(lambda _=False, t=target: self._start_rebind(t))
+            row.addWidget(btn)
+            lay.addLayout(row)
+            self.key_buttons[target] = btn
+
+        self.settings_note = QLabel("")
+        self.settings_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.settings_note.setStyleSheet("color: #ef5350;")
+        lay.addWidget(self.settings_note)
+        lay.addSpacing(6)
+
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("Save Directory"))
+        dir_row.addStretch()
+        browse = QPushButton("Browse")
+        browse.clicked.connect(lambda: self._select_directory())
+        dir_row.addWidget(browse)
+        lay.addLayout(dir_row)
+
+        self.dir_label = QLabel(self.save_directory)
+        self.dir_label.setWordWrap(True)
+        self.dir_label.setProperty("muted", True)
+        self.dir_label.setStyleSheet("font-size: 11px;")
+        lay.addWidget(self.dir_label)
+
+        self.audio_check = QCheckBox("Record Audio")
+        self.audio_check.setChecked(True)
+        lay.addWidget(self.audio_check)
+
+        length_row = QHBoxLayout()
+        length_row.addWidget(QLabel("Clip length (s):"))
+        length_row.addStretch()
+        self.length_spin = QSpinBox()
+        self.length_spin.setRange(5, 120)
+        self.length_spin.setSingleStep(5)
+        self.length_spin.setValue(self.clip_duration)
+        self.length_spin.valueChanged.connect(lambda _=0: self._apply_duration())
+        length_row.addWidget(self.length_spin)
+        lay.addLayout(length_row)
+
+        lay.addStretch()
+        return page
+
+    def _build_tray(self):
+        self.tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
+        self.tray = QSystemTrayIcon(make_icon(False), self)
+        self.tray.setToolTip("Clippy")
+
+        menu = QMenu()
+        menu.addAction("Show Clippy", self.show_window)
+        menu.addSeparator()
+        self.act_buffer = menu.addAction("Start buffer", self.toggle_buffer)
+        self.act_clip = menu.addAction("Save clip", self.save_clip)
+        menu.addSeparator()
+        self.act_macro = menu.addAction("Play macro", lambda: self.toggle_macro(0))
+        self.act_macro_rec = menu.addAction("Record mouse macro", lambda: self.toggle_macro_recording())
+        menu.addSeparator()
+        menu.addAction("Open save folder", self.open_save_folder)
+        menu.addAction("Quit", self.quit_app)
+        menu.aboutToShow.connect(self.refresh_tray_menu)
+
+        self._tray_menu = menu
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._tray_activated)
+        self.tray.messageClicked.connect(self._toast_clicked)
+        if self.tray_ok:
+            self.tray.show()
+
+    def refresh_tray_menu(self):
+        self.act_buffer.setText("Stop buffer" if self.is_running else "Start buffer")
+        self.act_clip.setEnabled(self.is_running)
+        self.act_macro.setText("Stop macro" if self._macro_running or self._macro_countdown else "Play macro")
+        self.act_macro_rec.setText("Stop recording mouse" if self._macro_recording else "Record mouse macro")
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.show_window()
+
+    def _toast_clicked(self):
+        if self._toast_folder and os.path.isdir(self._toast_folder):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._toast_folder))
+
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def open_save_folder(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.save_directory))
+
+    def update_tray_state(self):
+        self.tray.setIcon(make_icon(self.is_running))
+        self.tray.setToolTip("Clippy - recording" if self.is_running else "Clippy")
+
+    def notify(self, title, message="", folder=None):
+        self.ui(lambda: self._show_toast(title, message, folder))
+
+    def _show_toast(self, title, message, folder):
+        self._toast_folder = folder
+        if self.tray_ok:
+            self.tray.showMessage(title, message or "Clippy",
+                                  QSystemTrayIcon.MessageIcon.NoIcon, 4000)
+
+    def closeEvent(self, event):
+        if self._quitting:
+            event.accept()
+            return
+        if not self.tray_ok:
+            event.ignore()
+            self.quit_app()
+            return
+        event.ignore()
+        self.hide()
+        if not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            self.notify("Clippy is still running", "It's in the system tray. Hotkeys still work.")
+
+    def quit_app(self):
+        self._quitting = True
+        self.is_running = False
+        self.is_screen_recording = False
+        self._macro_stop.set()
+        self.audio_recorder.stop()
+        self.screen_audio.stop()
+        try:
+            if self._rec_listener:
+                self._rec_listener.stop()
+        except Exception:
+            pass
+        try:
+            self.hotkey_listener.stop()
+        except Exception:
+            pass
+        self.tray.hide()
+        QApplication.quit()
+
+    def refresh_labels(self):
+        for target, btn in self.key_buttons.items():
+            btn.setText(self.keys[target])
+            set_kind(btn, "")
+        state = "Stop" if self.is_running else "Record Buffer"
+        self.toggle_btn.setText("{} ({})".format(state, self.keys["record"]))
+        self.clip_btn.setText("SAVE CLIP ({})".format(self.keys["clip"]))
+        self.update_macro_buttons()
 
     def _start_rebind(self, target):
         self.rebinding_target = target
-        if target == "record":
-            self.rec_key_btn.config(text="Press Key...", bg="
-        elif target == "clip":
-            self.clip_key_btn.config(text="Press Key...", bg="
+        self.settings_note.setText("")
+        btn = self.key_buttons[target]
+        btn.setText("Press Key...")
+        set_kind(btn, "amber")
+
+    def _finish_rebind(self, key_str, changed):
+        self.refresh_labels()
+        if changed:
+            self.settings_note.setText("")
+        else:
+            self.settings_note.setText("{} is already used by another action".format(key_str))
 
     def _on_key_release(self, key):
         self._held.pop(self._parse_key_name(key), None)
@@ -460,86 +753,82 @@ class GameplayClipperApp:
         if self.rebinding_target:
             target = self.rebinding_target
             self.rebinding_target = None
-            if target == "record":
-                self.rec_key = key_str
-            elif target == "clip":
-                self.clip_key = key_str
-            self.root.after(0, self._update_ui_keybinds)
+            taken = [v for k, v in self.keys.items() if k != target]
+            if key_str in taken:
+                self.ui(lambda: self._finish_rebind(key_str, False))
+            else:
+                self.keys[target] = key_str
+                self.ui(lambda: self._finish_rebind(key_str, True))
             return
 
-        if key_str == self.rec_key:
+        if key_str == self.keys["record"]:
             print("Hotkey:", key_str, "-> toggle buffer")
-            self.root.after(0, self.toggle_buffer)
-        elif key_str == self.clip_key:
+            self.ui(self.toggle_buffer)
+        elif key_str == self.keys["clip"]:
             print("Hotkey:", key_str, "-> save clip")
             if self.is_running:
-                self.root.after(0, self.save_clip)
+                self.ui(self.save_clip)
             else:
-                print("Not recording yet - press", self.rec_key, "first")
+                print("Not recording yet - press", self.keys["record"], "first")
+        elif key_str == self.keys["macro_play"]:
+            self.ui(lambda: self.toggle_macro(0))
+        elif key_str == self.keys["macro_rec"]:
+            self.ui(lambda: self.toggle_macro_recording())
 
     def _parse_key_name(self, key):
         if hasattr(key, "name") and key.name:
             return key.name.upper()
         elif hasattr(key, "char") and key.char:
             return key.char.upper()
-        return text(key).replace("Key.", "").upper()
+        return str(key).replace("Key.", "").upper()
 
-    def _update_ui_keybinds(self):
-        self.rec_key_btn.config(text=self.rec_key, bg="
-        self.clip_key_btn.config(text=self.clip_key, bg="
-        state_text = "Stop" if self.is_running else "Record Buffer"
-        self.toggle_btn.config(text="{} ({})".format(state_text, self.rec_key))
-        self.clip_btn.config(text="SAVE CLIP ({})".format(self.clip_key))
-
-    def _set_status(self, text):
+    def set_status(self, text):
         print(text)
-        try:
-            self.root.after(0, lambda: self.status_label.config(text="Status: " + text))
-        except Exception:
-            pass
+        self.ui(lambda: self.status_label.setText("Status: " + text))
 
-    def _get_save_dir(self):
-        return os.getcwd()
+    def _apply_duration(self):
+        val = self.length_spin.value()
+        if val == self.clip_duration:
+            return
+        self.clip_duration = val
+        self.frame_buffer = deque(list(self.frame_buffer), maxlen=self.fps * val)
+        self.audio_recorder.update_duration(val)
 
-    def _audio_enabled(self):
-        return True
-
-    def _prepare_recording(self):
-        pass
-
-    def _notify(self, title, message, folder=None):
-        pass
-
-    def _on_buffer_state_changed(self):
-        pass
+    def _select_directory(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose where clips are saved", self.save_directory)
+        if folder:
+            self.save_directory = folder
+            self.dir_label.setText(folder)
+            print("Save directory set to:", folder)
 
     def toggle_buffer(self):
         if not self.is_running:
-            self._prepare_recording()
+            self._apply_duration()
             self.is_running = True
             self.frame_buffer.clear()
-            self.toggle_btn.config(text="Stop ({})".format(self.rec_key), bg="
-            self.clip_btn.config(state="normal")
+            set_kind(self.toggle_btn, "red")
+            self.clip_btn.setEnabled(True)
 
-            if self._audio_enabled():
+            if self.audio_check.isChecked():
                 self.audio_recorder.start()
-            self._set_status("Buffer recording...")
+            self.set_status("Buffer recording...")
             self.capture_thread = threading.Thread(target=self._record_loop, daemon=True)
             self.capture_thread.start()
-            self._notify("Buffer recording", "Press {} to save the last {}s.".format(
-                self.clip_key, self.clip_duration))
+            self.notify("Buffer recording", "Press {} to save the last {}s.".format(
+                self.keys["clip"], self.clip_duration))
         else:
             self.is_running = False
             self.audio_recorder.stop()
-            self.toggle_btn.config(text="Record Buffer ({})".format(self.rec_key), bg="
-            self.clip_btn.config(state="disabled")
-            self._set_status("Idle")
-            self._notify("Buffer stopped", "Clippy is no longer recording.")
-        self._on_buffer_state_changed()
+            set_kind(self.toggle_btn, "green")
+            self.clip_btn.setEnabled(False)
+            self.set_status("Idle")
+            self.notify("Buffer stopped", "Clippy is no longer recording.")
+        self.refresh_labels()
+        self.update_tray_state()
 
     def _record_loop(self):
         with mss.mss() as sct:
-            monitor = sct.monitors[1] if length(sct.monitors) > 1 else sct.monitors[0]
+            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
             frame_delay = 1.0 / self.fps
 
             while self.is_running:
@@ -558,28 +847,28 @@ class GameplayClipperApp:
 
     def save_clip(self):
         if not self.frame_buffer:
-            self._set_status("Buffer empty - nothing to save")
-            self._notify("Nothing to save", "The buffer is empty.")
+            self.set_status("Buffer empty - nothing to save")
+            self.notify("Nothing to save", "The buffer is empty.")
             return
 
         frames = list(self.frame_buffer)
         timestamp = unique_timestamp()
-        target_dir = self._get_save_dir()
-        record_audio = self._audio_enabled()
+        target_dir = self.save_directory
+        record_audio = self.audio_check.isChecked()
 
         audio_chunks = self.audio_recorder._snapshot() if record_audio else []
         print("Saving clip: {} frames, {} audio chunks -> {}".format(
-            length(frames), length(audio_chunks), target_dir))
-        self._set_status("Saving clip...")
-        self._notify("Saving clip...", "Hang tight, encoding your clip.")
+            len(frames), len(audio_chunks), target_dir))
+        self.set_status("Saving clip...")
+        self.notify("Saving clip...", "Hang tight, encoding your clip.")
 
         def _run():
             try:
                 self._write_clip(frames, audio_chunks, timestamp, target_dir)
             except Exception:
                 traceback.print_exc()
-                self._set_status("Save FAILED - see console")
-                self._notify("Clip failed", "Something went wrong while saving.")
+                self.set_status("Save FAILED - see console")
+                self.notify("Clip failed", "Something went wrong while saving.")
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -624,410 +913,129 @@ class GameplayClipperApp:
             safe_replace(temp_video, final_output)
 
         if os.path.exists(final_output):
-            self._set_status("Saved " + os.path.basename(final_output))
+            self.set_status("Saved " + os.path.basename(final_output))
             print("Saved to:", final_output)
-            self._notify("Clip saved", os.path.basename(final_output), folder=target_dir)
+            self.notify("Clip saved", os.path.basename(final_output), folder=target_dir)
         else:
-            self._set_status("Save FAILED - no file created")
-            self._notify("Clip failed", "No file was created.")
+            self.set_status("Save FAILED - no file created")
+            self.notify("Clip failed", "No file was created.")
 
-class GameplayClippingApp(GameplayClipperApp):
-    def __init__(self, root):
-        self.save_directory = os.path.join(os.path.expanduser("~"), "Videos")
-        if not os.path.exists(self.save_directory):
-            self.save_directory = os.getcwd()
+    def toggle_screen_recording(self):
+        if not self.is_screen_recording:
+            self.is_screen_recording = True
+            self.screen_rec_btn.setText("Stop Screen Recording")
+            set_kind(self.screen_rec_btn, "green")
+            self.screen_rec_status.setText("Status: Recording...")
+            self._color_label(self.screen_rec_status, "#ef5350")
+            self.screen_rec_start_time = time.time()
 
-        self.record_audio_var = tk.BooleanVar(master=root, value=True)
-        self.clip_duration_var = tk.StringVar(master=root, value="15")
+            record_audio = self.audio_check.isChecked()
+            target_dir = self.save_directory
+            if record_audio:
+                self.screen_audio.start()
 
-        self.tray_icon = None
-        self._tray_hint_shown = False
-        self._icon_png = os.path.join(tempfile.gettempdir(), "clippy_icon.png")
-        try:
-            make_tray_image().save(self._icon_png)
-        except Exception:
-            self._icon_png = None
+            threading.Thread(target=self._run_screen_recording,
+                             args=(record_audio, target_dir), daemon=True).start()
+            self._update_screen_rec_timer()
+            self.screen_timer.start()
+            self.notify("Screen recording started", "Clippy is recording your screen.")
+        else:
+            self.is_screen_recording = False
+            self.screen_rec_btn.setText("Start Screen Recording")
+            set_kind(self.screen_rec_btn, "red")
+            self.screen_rec_status.setText("Status: Processing...")
+            self._color_label(self.screen_rec_status, "#64b5f6")
 
-        self.macro_steps = []
-        self.macro_key = "F3"
-        self._macro_stop = threading.Event()
-        self._macro_running = False
-        self._macro_countdown = False
-        self._macro_token = 0
-        self._macro_down = set()
-        self._mouse = mouse.Controller()
-        self.macro_dist_var = tk.StringVar(master=root, value="50")
-        self.macro_wait_var = tk.StringVar(master=root, value="0.5")
-        self.macro_repeat_var = tk.StringVar(master=root, value="1")
-
-        self.macro_rec_key = "F4"
-        self.macro_rec_secs_var = tk.StringVar(master=root, value="5")
-        self._macro_recording = False
-        self._rec_token = 0
-        self._rec_listener = None
-        self._rec_events = []
-        self._rec_latest = None
-        self._rec_t0 = 0.0
-        self._rec_secs = 5.0
-        self._rec_rect = None
-        self._rec_last_sample = 0.0
-
-        super().__init__(root)
-
-        self.root.geometry("480x640")
-        self.nav_macro_btn = tk.Button(
-            self.sidebar, text="⌖", font=("Segoe UI Symbol", 16),
-            bg="
-            activeforeground="
-            command=self.show_macro_page
-        )
-        self.nav_macro_btn.pack(side="top", pady=6, anchor="center",
-                                after=self.nav_screen_rec_btn)
-        self._build_macro_view()
-
-        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
-        self._start_tray()
-
-    def _build_settings_view(self):
-        super()._build_settings_view()
-
-        play_row = tk.Frame(self.settings_frame)
-        play_row.pack(fill="data", padx=40, pady=5)
-        tk.Label(play_row, text="Play Macro:", font=("Helvetica", 10),
-                 width=16, anchor="w").pack(side="left")
-        self.macro_key_btn = tk.Button(
-            play_row, text=self.macro_key, font=("Helvetica", 10, "bold"), width=12,
-            command=lambda: self._start_rebind("macro_play")
-        )
-        self.macro_key_btn.pack(side="right")
-
-        mrec_row = tk.Frame(self.settings_frame)
-        mrec_row.pack(fill="data", padx=40, pady=5)
-        tk.Label(mrec_row, text="Record Macro:", font=("Helvetica", 10),
-                 width=16, anchor="w").pack(side="left")
-        self.macro_rec_key_btn = tk.Button(
-            mrec_row, text=self.macro_rec_key, font=("Helvetica", 10, "bold"), width=12,
-            command=lambda: self._start_rebind("macro_rec")
-        )
-        self.macro_rec_key_btn.pack(side="right")
-
-        dir_row = tk.Frame(self.settings_frame)
-        dir_row.pack(fill="data", padx=40, pady=4)
-        tk.Label(dir_row, text="Save Directory", font=("Helvetica", 10),
-                 width=16, anchor="w").pack(side="left")
-        self.dir_btn = tk.Button(dir_row, text="Browse", font=("Helvetica", 9),
-                                 command=self._select_directory)
-        self.dir_btn.pack(side="right")
-
-        self.dir_label = tk.Label(
-            self.settings_frame, text=self.save_directory,
-            font=("Helvetica", 8), fg="
-            justify="left", wraplength=330
-        )
-        self.dir_label.pack(fill="data", padx=40)
-
-        audio_row = tk.Frame(self.settings_frame)
-        audio_row.pack(fill="data", padx=40, pady=4)
-        tk.Label(audio_row, text="Record Audio", font=("Helvetica", 10),
-                 width=16, anchor="w").pack(side="left")
-        tk.Checkbutton(audio_row, variable=self.record_audio_var).pack(side="right")
-
-        dur_row = tk.Frame(self.settings_frame)
-        dur_row.pack(fill="data", padx=40, pady=4)
-        tk.Label(dur_row, text="Clip length (s):", font=("Helvetica", 10),
-                 width=16, anchor="w").pack(side="left")
-        dur_spin = tk.Spinbox(
-            dur_row, from_=5, to=120, increment=5,
-            textvariable=self.clip_duration_var, width=8,
-            command=self._apply_duration
-        )
-        dur_spin.pack(side="right")
-        dur_spin.bind("<Return>", lambda e: self._apply_duration())
-        dur_spin.bind("<FocusOut>", lambda e: self._apply_duration())
-
-    def _select_directory(self):
-        self.dir_btn.config(state="disabled", text="Choosing...")
-        threading.Thread(target=self._pick_directory_worker, daemon=True).start()
-
-    def _pick_directory_worker(self):
-        folder = None
-        try:
-            script = (
-                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "$owner = New-Object System.Windows.Forms.Form; "
-                "$owner.TopMost = $true; "
-                "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-                "$f.Description = 'Choose where clips are saved'; "
-                "$f.SelectedPath = '{}'; "
-                "if ($f.ShowDialog($owner) -eq 'OK') {{ Write-Output $f.SelectedPath }}"
-            ).format(self.save_directory.replace("'", "''"))
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-STA", "-Command", script],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                creationflags=flags
-            )
-            text = result.stdout.decode("utf-8", "ignore").strip()
-            if text and os.path.isdir(text):
-                folder = text
-        except Exception:
-            traceback.print_exc()
-        self.root.after(0, lambda: self._finish_pick_directory(folder))
-
-    def _finish_pick_directory(self, folder):
-        self.dir_btn.config(state="normal", text="Browse")
-        if folder:
-            self.save_directory = folder
-            self.dir_label.config(text=folder)
-            print("Save directory set to:", folder)
-
-    def _apply_duration(self):
-        try:
-            input = int(self.clip_duration_var.get())
-        except ValueError:
+    def _update_screen_rec_timer(self):
+        if not self.is_screen_recording:
+            self.screen_timer.stop()
             return
-        input = largest(5, lowest(120, input))
-        self.clip_duration_var.set(text(input))
-        self.clip_duration = input
-        self.frame_buffer = deque(list(self.frame_buffer), maxlen=self.fps * input)
-        self.audio_recorder.update_duration(input)
+        elapsed = int(time.time() - self.screen_rec_start_time)
+        hrs = elapsed // 3600
+        mins = (elapsed % 3600) // 60
+        secs = elapsed % 60
+        self.screen_rec_timer_label.setText("{:02d}:{:02d}:{:02d}".format(hrs, mins, secs))
 
-    def _get_save_dir(self):
-        return self.save_directory
+    def _reset_screen_rec_ui(self):
+        self.screen_rec_status.setText("Status: Idle")
+        self._color_label(self.screen_rec_status, "#8b8fa8")
+        self.screen_rec_timer_label.setText("00:00:00")
 
-    def _audio_enabled(self):
-        return self.record_audio_var.get()
+    def _run_screen_recording(self, record_audio, target_dir):
+        timestamp = unique_timestamp()
+        temp_video = os.path.join(target_dir, "temp_rec_video_{}.mp4".format(timestamp))
+        temp_audio = os.path.join(target_dir, "temp_rec_audio_{}.wav".format(timestamp))
+        final_output = os.path.join(target_dir, "recording_{}.mp4".format(timestamp))
 
-    def _prepare_recording(self):
-        self._apply_duration()
+        with mss.mss() as sct:
+            monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+            width = monitor["width"]
+            height = monitor["height"]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(temp_video, fourcc, float(self.fps), (width, height))
 
-    def _start_tray(self):
-        menu = pystray.Menu(
-            pystray.MenuItem("Show Clippy", self._tray_show, default=True),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                lambda item: "Stop buffer" if self.is_running else "Start buffer",
-                self._tray_toggle_buffer),
-            pystray.MenuItem("Save clip", self._tray_save_clip,
-                             enabled=lambda item: self.is_running),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                lambda item: "Stop macro" if self._macro_active() else "Play macro",
-                self._tray_toggle_macro),
-            pystray.MenuItem(
-                lambda item: "Stop recording mouse" if self._macro_recording else "Record mouse macro",
-                self._tray_toggle_macro_rec),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Open save folder", self._tray_open_folder),
-            pystray.MenuItem("Quit", self._tray_quit),
-        )
-        self.tray_icon = pystray.Icon("Clippy", make_tray_image(False), "Clippy", menu)
-        self.tray_icon.run_detached()
+            frame_delay = 1.0 / self.fps
+            while self.is_screen_recording:
+                start_time = time.time()
+                try:
+                    sct_img = sct.grab(monitor)
+                    frame_np = np.array(sct_img)
+                    frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_BGRA2BGR)
+                    out.write(frame_bgr)
+                except Exception:
+                    pass
 
-    def _macro_active(self):
-        return self._macro_running or self._macro_countdown
+                sleep_time = frame_delay - (time.time() - start_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 
-    def _on_buffer_state_changed(self):
-        if not self.tray_icon:
-            return
-        try:
-            self.tray_icon.icon = make_tray_image(self.is_running)
-            self.tray_icon.title = "Clippy - recording" if self.is_running else "Clippy"
-            self.tray_icon.update_menu()
-        except Exception:
-            traceback.print_exc()
+            out.release()
+            del out
 
-    def hide_to_tray(self):
-        self.root.withdraw()
-        if not self._tray_hint_shown:
-            self._tray_hint_shown = True
-            self._notify("Clippy is still running",
-                         "It's in the system tray. Hotkeys still work.")
+        time.sleep(0.2)
 
-    def _tray_show(self, icon=None, item=None):
-        self.root.after(0, self._restore_window)
+        has_audio = False
+        if record_audio:
+            self.screen_audio.stop()
+            has_audio = self.screen_audio.save_wav(temp_audio)
 
-    def _restore_window(self):
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
+        merged = False
+        if has_audio and os.path.exists(temp_video):
+            merged = merge_video_audio(temp_video, temp_audio, final_output)
+            if merged:
+                safe_remove(temp_video)
+            safe_remove(temp_audio)
 
-    def _tray_toggle_buffer(self, icon=None, item=None):
-        self.root.after(0, self.toggle_buffer)
+        if not merged and os.path.exists(temp_video):
+            safe_replace(temp_video, final_output)
 
-    def _tray_save_clip(self, icon=None, item=None):
-        if self.is_running:
-            self.root.after(0, self.save_clip)
+        if os.path.exists(final_output):
+            self.notify("Recording saved", os.path.basename(final_output), folder=target_dir)
+        else:
+            self.notify("Recording failed", "No file was created.")
 
-    def _tray_toggle_macro(self, icon=None, item=None):
-        self.root.after(0, lambda: self.toggle_macro(0))
+        self.ui(self._reset_screen_rec_ui)
 
-    def _tray_toggle_macro_rec(self, icon=None, item=None):
-        self.root.after(0, self.toggle_macro_recording)
+    def set_macro_status(self, text, color="#8b8fa8"):
+        self.macro_status.setText(text)
+        self._color_label(self.macro_status, color)
 
-    def _tray_open_folder(self, icon=None, item=None):
-        try:
-            os.startfile(self.save_directory)
-        except Exception:
-            traceback.print_exc()
-
-    def _tray_quit(self, icon=None, item=None):
-        self.root.after(0, self.quit_app)
-
-    def quit_app(self):
-        self.is_running = False
-        self.is_screen_recording = False
-        self._macro_stop.set()
-        self.audio_recorder.stop()
-        self.screen_audio.stop()
-        try:
-            if self._rec_listener:
-                self._rec_listener.stop()
-        except Exception:
-            pass
-        try:
-            self.hotkey_listener.stop()
-        except Exception:
-            pass
-        try:
-            if self.tray_icon:
-                self.tray_icon.stop()
-        except Exception:
-            pass
-        self.root.destroy()
-
-    def _notify(self, title, message, folder=None):
-        def _show():
-            try:
-                if HAVE_WINOTIFY:
-                    toast = Notification(
-                        app_id="Clippy", title=title, msg=message or "Clippy",
-                        icon=self._icon_png or "", duration="short")
-                    toast.set_audio(audio.Default, loop=False)
-                    if folder and os.path.isdir(folder):
-                        toast.add_actions(label="Open folder", launch=folder)
-                    toast.show()
-                elif self.tray_icon:
-                    self.tray_icon.notify(message or "Clippy", title)
-            except Exception:
-                traceback.print_exc()
-        threading.Thread(target=_show, daemon=True).start()
-
-    def _hide_macro_page(self):
-        frame = getattr(self, "macro_frame", None)
-        if frame is not None:
-            frame.pack_forget()
-
-    def show_main_page(self):
-        self._hide_macro_page()
-        super().show_main_page()
-
-    def show_screen_rec_page(self):
-        self._hide_macro_page()
-        super().show_screen_rec_page()
-
-    def show_settings_page(self):
-        self._hide_macro_page()
-        super().show_settings_page()
-
-    def show_macro_page(self):
-        self.main_frame.pack_forget()
-        self.screen_rec_frame.pack_forget()
-        self.settings_frame.pack_forget()
-        self.macro_frame.pack(fill="both", expand=True)
-
-    def _build_macro_view(self):
-        self.macro_frame = tk.Frame(self.content_area)
-        mf = self.macro_frame
-
-        tk.Label(mf, text="MACRO", font=("Helvetica", 18, "bold")).pack(pady=(14, 4))
-        tk.Label(mf, text="Click controls to add steps, then press play.",
-                 font=("Helvetica", 9, "italic"), fg="
-
-        pad = tk.Frame(mf)
-        pad.pack(pady=(10, 4))
-
-        def move_btn(text, row, col, dx, dy):
-            tk.Button(
-                pad, text=text, width=13, pady=3, relief="flat",
-                bg="
-                command=lambda: self._add_move(dx, dy)
-            ).grid(row=row, column=col, padx=3, pady=3)
-
-        move_btn("▲  Mouse Up", 0, 1, 0, -1)
-        move_btn("◀  Mouse Left", 1, 0, -1, 0)
-        move_btn("Mouse Right  ▶", 1, 2, 1, 0)
-        move_btn("▼  Mouse Down", 2, 1, 0, 1)
-        tk.Label(pad, text="✥", font=("Segoe UI Symbol", 14), fg="
-
-        btn_row = tk.Frame(mf)
-        btn_row.pack(pady=4)
-        for text, step in (
-            ("Left Click", {"type": "click", "button": "left"}),
-            ("Right Click", {"type": "click", "button": "right"}),
-            ("Hold Left", {"type": "down", "button": "left"}),
-            ("Release Left", {"type": "up", "button": "left"}),
-        ):
-            tk.Button(
-                btn_row, text=text, width=10, relief="flat", bg="
-                font=("Helvetica", 8, "bold"),
-                command=lambda s=step: self._add_step(dict(s))
-            ).pack(side="left", padx=2)
-
-        rec_row = tk.Frame(mf)
-        rec_row.pack(pady=(8, 0))
-        self.macro_rec_btn = tk.Button(
-            rec_row, command=self.toggle_macro_recording, bg="
-            font=("Helvetica", 9, "bold"), width=22, relief="flat", pady=3
-        )
-        self.macro_rec_btn.pack(side="left")
-        tk.Label(rec_row, text="Length (s)", font=("Helvetica", 9)).pack(side="left", padx=(10, 3))
-        tk.Spinbox(rec_row, from_=1, to=60, width=4,
-                   textvariable=self.macro_rec_secs_var).pack(side="left")
-
-        opt = tk.Frame(mf)
-        opt.pack(pady=(8, 2))
-        tk.Label(opt, text="Distance (px)", font=("Helvetica", 9)).grid(row=0, column=0, padx=4)
-        tk.Spinbox(opt, from_=1, to=2000, increment=10, width=6,
-                   textvariable=self.macro_dist_var).grid(row=0, column=1, padx=(0, 12))
-        tk.Label(opt, text="Wait (s)", font=("Helvetica", 9)).grid(row=0, column=2, padx=4)
-        tk.Spinbox(opt, from_=0.05, to=60, increment=0.25, width=6,
-                   textvariable=self.macro_wait_var).grid(row=0, column=3)
-        tk.Button(opt, text="Add Wait", font=("Helvetica", 8, "bold"), relief="flat",
-                  bg="
-
-        list_frame = tk.Frame(mf)
-        list_frame.pack(fill="both", expand=True, padx=20, pady=(8, 2))
-        scroll = tk.Scrollbar(list_frame)
-        scroll.pack(side="right", fill="temp")
-        self.macro_list = tk.Listbox(
-            list_frame, height=7, font=("Consolas", 10), activestyle="none",
-            exportselection=False, yscrollcommand=scroll.set,
-            selectbackground="
-        )
-        self.macro_list.pack(side="left", fill="both", expand=True)
-        scroll.config(command=self.macro_list.yview)
-
-        edit_row = tk.Frame(mf)
-        edit_row.pack(pady=4)
-        tk.Button(edit_row, text="Remove Selected", font=("Helvetica", 8), width=15,
-                  command=self._remove_step).pack(side="left", padx=3)
-        tk.Button(edit_row, text="Clear All", font=("Helvetica", 8), width=10,
-                  command=self._clear_steps).pack(side="left", padx=3)
-        tk.Label(edit_row, text="Repeat (0 = loop)", font=("Helvetica", 9)).pack(side="left", padx=(12, 3))
-        tk.Spinbox(edit_row, from_=0, to=9999, width=5,
-                   textvariable=self.macro_repeat_var).pack(side="left")
-
-        self.macro_play_btn = tk.Button(
-            mf, command=lambda: self.toggle_macro(3), bg="
-            font=("Helvetica", 11, "bold"), width=24, pady=6, relief="flat"
-        )
-        self.macro_play_btn.pack(pady=(8, 4))
-
-        self.macro_status = tk.Label(mf, text="Ready", font=("Helvetica", 9, "bold"), fg="
-        self.macro_status.pack(pady=(0, 10))
-        self._update_macro_btn()
+    def update_macro_buttons(self):
+        busy = self._macro_running or self._macro_countdown
+        play_key = self.keys["macro_play"]
+        rec_key = self.keys["macro_rec"]
+        if busy:
+            self.macro_play_btn.setText("■ Stop Macro ({})".format(play_key))
+            set_kind(self.macro_play_btn, "orange")
+        else:
+            self.macro_play_btn.setText("▶ Play Macro ({})".format(play_key))
+            set_kind(self.macro_play_btn, "green")
+        if self._macro_recording:
+            self.macro_rec_btn.setText("■ Stop Recording ({})".format(rec_key))
+            set_kind(self.macro_rec_btn, "orange")
+        else:
+            self.macro_rec_btn.setText("● Record Mouse ({})".format(rec_key))
+            set_kind(self.macro_rec_btn, "red")
 
     def _step_text(self, s):
         t = s["type"]
@@ -1048,8 +1056,8 @@ class GameplayClippingApp(GameplayClipperApp):
         if t == "up":
             return "Release {} Button".format(s["button"].capitalize())
         if t == "path":
-            moves = aggregate(1 for e in s["events"] if e[1] == "move")
-            clicks = aggregate(1 for e in s["events"] if e[1] == "down")
+            moves = sum(1 for e in s["events"] if e[1] == "move")
+            clicks = sum(1 for e in s["events"] if e[1] == "down")
             text = "Recorded path {}s ({} moves".format(s["secs"], moves)
             if clicks:
                 text += ", {} clicks".format(clicks)
@@ -1060,36 +1068,28 @@ class GameplayClippingApp(GameplayClipperApp):
         if self._macro_running or self._macro_countdown or self._macro_recording:
             return
         self.macro_steps.append(step)
-        self.macro_list.insert("end", "{:>2}. {}".format(length(self.macro_steps), self._step_text(step)))
-        self.macro_list.see("end")
+        self.macro_list.addItem("{:>2}. {}".format(len(self.macro_steps), self._step_text(step)))
+        self.macro_list.scrollToBottom()
 
     def _add_move(self, ux, uy):
-        try:
-            dist = int(float(self.macro_dist_var.get()))
-        except ValueError:
-            dist = 50
-        dist = largest(1, lowest(2000, dist))
+        dist = self.dist_spin.value()
         self._add_step({"type": "move", "dx": ux * dist, "dy": uy * dist})
 
     def _add_wait(self):
-        try:
-            secs = float(self.macro_wait_var.get())
-        except ValueError:
-            secs = 0.5
-        secs = round(largest(0.05, lowest(60.0, secs)), 2)
+        secs = round(self.wait_spin.value(), 2)
         self._add_step({"type": "wait", "secs": secs})
 
     def _refresh_macro_list(self):
-        self.macro_list.delete(0, "end")
-        for idx, s in enumerate(self.macro_steps, 1):
-            self.macro_list.insert("end", "{:>2}. {}".format(idx, self._step_text(s)))
+        self.macro_list.clear()
+        for i, s in enumerate(self.macro_steps, 1):
+            self.macro_list.addItem("{:>2}. {}".format(i, self._step_text(s)))
 
     def _remove_step(self):
         if self._macro_running or self._macro_countdown:
             return
-        sel = self.macro_list.curselection()
-        if sel:
-            del self.macro_steps[sel[0]]
+        row = self.macro_list.currentRow()
+        if row >= 0:
+            del self.macro_steps[row]
             self._refresh_macro_list()
 
     def _clear_steps(self):
@@ -1098,78 +1098,67 @@ class GameplayClippingApp(GameplayClipperApp):
         self.macro_steps.clear()
         self._refresh_macro_list()
 
-    def _update_macro_btn(self):
-        if self._macro_running or self._macro_countdown:
-            self.macro_play_btn.config(text="■ Stop Macro ({})".format(self.macro_key), bg="
-        else:
-            self.macro_play_btn.config(text="▶ Play Macro ({})".format(self.macro_key), bg="
-        if self._macro_recording:
-            self.macro_rec_btn.config(text="■ Stop Recording ({})".format(self.macro_rec_key), bg="
-        else:
-            self.macro_rec_btn.config(text="● Record Mouse ({})".format(self.macro_rec_key), bg="
-
     def toggle_macro(self, delay=3):
         if self._macro_running or self._macro_countdown:
             self.stop_macro()
             return
         if self._macro_recording:
-            self.macro_status.config(text="Wait for the recording to finish", fg="
+            self.set_macro_status("Wait for the recording to finish", "#ef5350")
             return
         if not self.macro_steps:
-            self.macro_status.config(text="Add some steps first", fg="
+            self.set_macro_status("Add some steps first", "#ef5350")
             return
         self._macro_stop.clear()
-        self._macro_token += 1
         if delay > 0:
             self._macro_countdown = True
-            self._update_macro_btn()
-            self._macro_count(delay, self._macro_token)
+            self._countdown_left = delay
+            self.update_macro_buttons()
+            self._countdown_step()
+            self.countdown_timer.start()
         else:
             self._start_macro()
 
-    def _macro_count(self, total, token):
-        if token != self._macro_token or not self._macro_countdown:
+    def _countdown_step(self):
+        if not self._macro_countdown:
+            self.countdown_timer.stop()
             return
-        if total <= 0:
+        if self._countdown_left <= 0:
+            self.countdown_timer.stop()
             self._macro_countdown = False
             self._start_macro()
             return
-        self.macro_status.config(
-            text="Starting in {}s - switch to your game...".format(total), fg="
-        self.root.after(1000, lambda: self._macro_count(total - 1, token))
+        self.set_macro_status("Starting in {}s - switch to your game...".format(self._countdown_left), "#64b5f6")
+        self._countdown_left -= 1
 
     def _start_macro(self):
-        try:
-            repeat = largest(0, int(self.macro_repeat_var.get()))
-        except ValueError:
-            repeat = 1
+        repeat = self.repeat_spin.value()
         self._macro_running = True
-        self._update_macro_btn()
-        self.macro_status.config(text="Running... ({} to stop)".format(self.macro_key), fg="
-        self._notify("Macro running", "Press {} to stop.".format(self.macro_key))
+        self.update_macro_buttons()
+        self.set_macro_status("Running... ({} to stop)".format(self.keys["macro_play"]), "#66bb6a")
+        self.notify("Macro running", "Press {} to stop.".format(self.keys["macro_play"]))
         threading.Thread(
             target=self._run_macro, args=(list(self.macro_steps), repeat), daemon=True
         ).start()
 
     def stop_macro(self):
-        self._macro_token += 1
         self._macro_stop.set()
         if self._macro_countdown:
             self._macro_countdown = False
-            self._update_macro_btn()
-            self.macro_status.config(text="Stopped", fg="
+            self.countdown_timer.stop()
+            self.update_macro_buttons()
+            self.set_macro_status("Stopped")
 
     def _run_macro(self, steps, repeat):
         held = []
         try:
-            total = 0
-            while not self._macro_stop.is_set() and (repeat == 0 or total < repeat):
-                for idx, step in enumerate(steps):
+            n = 0
+            while not self._macro_stop.is_set() and (repeat == 0 or n < repeat):
+                for i, step in enumerate(steps):
                     if self._macro_stop.is_set():
                         break
-                    self.root.after(0, lambda idx=idx: self._macro_highlight(idx))
+                    self.ui(lambda i=i: self._macro_highlight(i))
                     self._do_step(step, held)
-                total += 1
+                n += 1
                 self._macro_stop.wait(0.01)
         except Exception:
             traceback.print_exc()
@@ -1180,7 +1169,7 @@ class GameplayClippingApp(GameplayClipperApp):
                 except Exception:
                     pass
             stopped = self._macro_stop.is_set()
-            self.root.after(0, lambda: self._macro_done(stopped))
+            self.ui(lambda: self._macro_done(stopped))
 
     def _do_step(self, step, held):
         t = step["type"]
@@ -1230,39 +1219,34 @@ class GameplayClippingApp(GameplayClipperApp):
         self._macro_stop.wait(0.02)
 
     def _macro_highlight(self, idx):
-        self.macro_list.selection_clear(0, "end")
-        self.macro_list.selection_set(idx)
-        self.macro_list.see(idx)
+        self.macro_list.setCurrentRow(idx)
+        self.macro_list.scrollToItem(self.macro_list.item(idx))
 
     def _macro_done(self, stopped):
         self._macro_running = False
-        self.macro_list.selection_clear(0, "end")
-        self._update_macro_btn()
-        self.macro_status.config(text="Stopped" if stopped else "Finished",
-                                 fg="
-        self._notify("Macro stopped" if stopped else "Macro finished", "Clippy macro")
+        self.macro_list.clearSelection()
+        self.macro_list.setCurrentRow(-1)
+        self.update_macro_buttons()
+        if stopped:
+            self.set_macro_status("Stopped")
+        else:
+            self.set_macro_status("Finished", "#66bb6a")
+        self.notify("Macro stopped" if stopped else "Macro finished", "Clippy macro")
 
     def toggle_macro_recording(self):
         if self._macro_recording:
             self._finish_recording()
             return
         if self._macro_running or self._macro_countdown:
-            self.macro_status.config(text="Stop the macro before recording", fg="
+            self.set_macro_status("Stop the macro before recording", "#ef5350")
             return
-        try:
-            secs = float(self.macro_rec_secs_var.get())
-        except ValueError:
-            secs = 5.0
-        self._rec_secs = largest(1.0, lowest(60.0, secs))
+        self._rec_secs = float(self.rec_secs_spin.value())
 
         self._rec_rect = None
-        try:
-            if self.root.state() == "normal":
-                data, temp = self.root.winfo_rootx(), self.root.winfo_rooty()
-                self._rec_rect = (data, temp - 40, data + self.root.winfo_width(),
-                                  temp + self.root.winfo_height())
-        except Exception:
-            pass
+        if self.isVisible() and not self.isMinimized():
+            g = self.frameGeometry()
+            r = self.devicePixelRatioF()
+            self._rec_rect = (g.left() * r, g.top() * r, g.right() * r, g.bottom() * r)
 
         px, py = self._mouse.position
         self._rec_events = [("pos", 0.0, int(px), int(py))]
@@ -1270,57 +1254,57 @@ class GameplayClippingApp(GameplayClipperApp):
         self._rec_last_sample = 0.0
         self._rec_t0 = time.perf_counter()
         self._macro_recording = True
-        self._rec_token += 1
         self._rec_listener = mouse.Listener(on_move=self._rec_on_move, on_click=self._rec_on_click)
         self._rec_listener.start()
-        self._update_macro_btn()
-        self._notify("Recording mouse", "Recording for {:g}s. Press {} to stop early.".format(
-            self._rec_secs, self.macro_rec_key))
-        self._rec_tick(self._rec_token)
+        self.update_macro_buttons()
+        self.notify("Recording mouse", "Recording for {:g}s. Press {} to stop early.".format(
+            self._rec_secs, self.keys["macro_rec"]))
+        self.rec_timer.start()
+        self._rec_tick()
 
-    def _rec_tick(self, token):
-        if token != self._rec_token or not self._macro_recording:
+    def _rec_tick(self):
+        if not self._macro_recording:
+            self.rec_timer.stop()
             return
         left = self._rec_secs - (time.perf_counter() - self._rec_t0)
         if left <= 0:
             self._finish_recording()
             return
-        self.macro_status.config(text="● Recording... {:.1f}s left".format(left), fg="
-        self.root.after(100, lambda: self._rec_tick(token))
+        self.set_macro_status("● Recording... {:.1f}s left".format(left), "#ef5350")
 
-    def _rec_inside(self, data, temp):
+    def _rec_inside(self, x, y):
         r = self._rec_rect
-        return bool(r) and r[0] <= data <= r[2] and r[1] <= temp <= r[3]
+        return bool(r) and r[0] <= x <= r[2] and r[1] <= y <= r[3]
 
-    def _rec_on_move(self, data, temp):
+    def _rec_on_move(self, x, y):
         now = time.perf_counter()
         t = now - self._rec_t0
         if t > self._rec_secs:
             return
-        self._rec_latest = (t, int(data), int(temp))
+        self._rec_latest = (t, int(x), int(y))
         if now - self._rec_last_sample >= 0.01:
             self._rec_last_sample = now
-            self._rec_events.append(("pos", t, int(data), int(temp)))
+            self._rec_events.append(("pos", t, int(x), int(y)))
 
-    def _rec_on_click(self, data, temp, button, pressed):
+    def _rec_on_click(self, x, y, button, pressed):
         name = getattr(button, "name", None)
         t = time.perf_counter() - self._rec_t0
-        if name not in ("left", "right") or t > self._rec_secs or self._rec_inside(data, temp):
+        if name not in ("left", "right") or t > self._rec_secs or self._rec_inside(x, y):
             return
-        self._rec_events.append(("pos", t, int(data), int(temp)))
+        self._rec_events.append(("pos", t, int(x), int(y)))
         self._rec_events.append(("down" if pressed else "up", t, name))
 
     def _finish_recording(self):
         if not self._macro_recording:
             return
         self._macro_recording = False
-        self._rec_token += 1
+        self.rec_timer.stop()
         try:
             self._rec_listener.stop()
         except Exception:
             pass
         self._rec_listener = None
-        elapsed = lowest(time.perf_counter() - self._rec_t0, self._rec_secs)
+        elapsed = min(time.perf_counter() - self._rec_t0, self._rec_secs)
 
         events = list(self._rec_events)
         if self._rec_latest and self._rec_latest[0] >= events[-1][1]:
@@ -1329,10 +1313,10 @@ class GameplayClippingApp(GameplayClipperApp):
         path, prev, pressed = [], None, set()
         for ev in events:
             if ev[0] == "pos":
-                _, t, data, temp = ev
-                if prev is not None and (data != prev[0] or temp != prev[1]):
-                    path.append((round(t, 3), "move", data - prev[0], temp - prev[1]))
-                prev = (data, temp)
+                _, t, x, y = ev
+                if prev is not None and (x != prev[0] or y != prev[1]):
+                    path.append((round(t, 3), "move", x - prev[0], y - prev[1]))
+                prev = (x, y)
             elif ev[0] == "down":
                 pressed.add(ev[2])
                 path.append((round(ev[1], 3), "down", ev[2]))
@@ -1342,74 +1326,30 @@ class GameplayClippingApp(GameplayClipperApp):
         for b in pressed:
             path.append((round(elapsed, 3), "up", b))
 
-        self._update_macro_btn()
+        self.update_macro_buttons()
         if not path:
-            self.macro_status.config(text="No mouse movement captured", fg="
-            self._notify("Nothing recorded", "No mouse movement was captured.")
+            self.set_macro_status("No mouse movement captured", "#ef5350")
+            self.notify("Nothing recorded", "No mouse movement was captured.")
             return
         self._add_step({"type": "path", "events": path, "secs": round(elapsed, 2)})
-        self.macro_status.config(
-            text="Recorded {:.1f}s - press Play ({})".format(elapsed, self.macro_key), fg="
-        self._notify("Mouse macro recorded",
-                     "{:.1f}s captured. Press {} to play it.".format(elapsed, self.macro_key))
+        self.set_macro_status(
+            "Recorded {:.1f}s - press Play ({})".format(elapsed, self.keys["macro_play"]), "#66bb6a")
+        self.notify("Mouse macro recorded",
+                    "{:.1f}s captured. Press {} to play it.".format(elapsed, self.keys["macro_play"]))
 
-    def _on_key_release(self, key):
-        self._macro_down.discard(self._parse_key_name(key))
-        super()._on_key_release(key)
 
-    def _start_rebind(self, target):
-        if target in ("macro_play", "macro_rec"):
-            self.rebinding_target = target
-            btn = self.macro_key_btn if target == "macro_play" else self.macro_rec_key_btn
-            btn.config(text="Press Key...", bg="
-        else:
-            super()._start_rebind(target)
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(make_icon())
+    apply_dark_palette(app)
+    app.setStyleSheet(build_stylesheet())
 
-    def _update_macro_keybinds(self, message=None):
-        self._update_ui_keybinds()
-        self.macro_key_btn.config(text=self.macro_key, bg="
-        self.macro_rec_key_btn.config(text=self.macro_rec_key, bg="
-        self._update_macro_btn()
-        if message:
-            self.macro_status.config(text=message, fg="
+    window = ClippyWindow()
+    window.show()
+    sys.exit(app.exec())
 
-    def _handle_key_press(self, key):
-        key_str = self._parse_key_name(key)
-
-        if self.rebinding_target in ("macro_play", "macro_rec"):
-            target = self.rebinding_target
-            self.rebinding_target = None
-            other = self.macro_rec_key if target == "macro_play" else self.macro_key
-            if key_str in (self.rec_key, self.clip_key, other):
-                self.root.after(0, lambda: self._update_macro_keybinds(
-                    "{} is already used by another action".format(key_str)))
-                return
-            if target == "macro_play":
-                self.macro_key = key_str
-            else:
-                self.macro_rec_key = key_str
-            self._macro_down.add(key_str)
-            self.root.after(0, self._update_macro_keybinds)
-            return
-
-        if self.rebinding_target in ("record", "clip") and key_str in (self.macro_key, self.macro_rec_key):
-            self.rebinding_target = None
-            self.root.after(0, lambda: self._update_macro_keybinds(
-                "{} is already used by a macro".format(key_str)))
-            return
-
-        if self.rebinding_target is None and key_str in (self.macro_key, self.macro_rec_key):
-            if key_str in self._macro_down:
-                return
-            self._macro_down.add(key_str)
-            if key_str == self.macro_key:
-                self.root.after(0, lambda: self.toggle_macro(0))
-            else:
-                self.root.after(0, self.toggle_macro_recording)
-            return
-        super()._handle_key_press(key)
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = GameplayClippingApp(root)
-    root.mainloop()
+    main()
