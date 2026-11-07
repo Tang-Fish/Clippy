@@ -12,8 +12,10 @@ Clippy is a lightweight clipping app made to take minimal system resources.
 SilverBench was used for testing
 
 Without Macro (Control)
+
 <img width="445.5" height="246" alt="image" src="https://github.com/user-attachments/assets/7f357556-da12-4a9f-b264-2416dc85b363" />
 
 With Macro
 That's a whole 22-digit difference! 
+
 <img width="445.5" height="246" alt="image" src="https://github.com/user-attachments/assets/315162b8-f7f4-4f64-a2d3-e258d9d712cf" />
